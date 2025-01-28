@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TXBUFSIZE       1
+#define RXBUFSIZE       1
+#define HEARTBEAT_MAX   9999
+#define HEARTBEAT_SLEEP 500
+#define MAX_STRING_LEN  50
+#define I2C_SLEEP       25
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,24 +50,53 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
+
 UART_HandleTypeDef huart2;
 
-/* Definitions for mainTask */
-osThreadId_t mainTaskHandle;
-const osThreadAttr_t mainTask_attributes = {
-  .name = "mainTask",
+/* Definitions for logTask */
+osThreadId_t logTaskHandle;
+const osThreadAttr_t logTask_attributes = {
+  .name = "logTask",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for otherTask */
-osThreadId_t otherTaskHandle;
-const osThreadAttr_t otherTask_attributes = {
-  .name = "otherTask",
+/* Definitions for I2CSendTask */
+osThreadId_t I2CSendTaskHandle;
+const osThreadAttr_t I2CSendTask_attributes = {
+  .name = "I2CSendTask",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for I2CReceiveTask */
+osThreadId_t I2CReceiveTaskHandle;
+const osThreadAttr_t I2CReceiveTask_attributes = {
+  .name = "I2CReceiveTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for I2CMutexTX */
+osMutexId_t I2CMutexTXHandle;
+const osMutexAttr_t I2CMutexTX_attributes = {
+  .name = "I2CMutexTX"
+};
+/* Definitions for UARTMutex */
+osMutexId_t UARTMutexHandle;
+const osMutexAttr_t UARTMutex_attributes = {
+  .name = "UARTMutex"
+};
+/* Definitions for I2CMutexRX */
+osMutexId_t I2CMutexRXHandle;
+const osMutexAttr_t I2CMutexRX_attributes = {
+  .name = "I2CMutexRX"
 };
 /* USER CODE BEGIN PV */
+volatile uint8_t rx_buf [1];
+uint8_t tx_buf;
 
+HAL_StatusTypeDef sig = 0x0;
+
+uint16_t heart_beat_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,15 +104,48 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
-void StartMain(void *argument);
-void StartOther(void *argument);
+static void MX_TIM1_Init(void);
+void StartLog(void *argument);
+void StartI2CSend(void *argument);
+void StartI2CReceive(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+void ResetI2C(I2C_HandleTypeDef* rev_i2c);
+void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c);
+void ProcessI2CData();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void ResetI2C(I2C_HandleTypeDef* rev_i2c)
+{
+  HAL_I2C_DeInit(rev_i2c);
+  HAL_I2C_Init(rev_i2c);
+}
+
+void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+  if (hi2c->Instance == I2C1) {
+    // Process Data
+    ProcessI2CData();
+    // Restart I2C reception
+    HAL_I2C_Slave_Receive_IT(hi2c, (uint8_t*)rx_buf, RXBUFSIZE);
+  }
+}
+
+void ProcessI2CData()
+{
+  osMutexAcquire(I2CMutexRXHandle, portMAX_DELAY);
+  uint8_t rx_recv = rx_buf[0];
+  osMutexRelease(I2CMutexRXHandle);
+  //UART Send
+  char i2c_rx_message[MAX_STRING_LEN];
+  sprintf(i2c_rx_message, "RECEIVED: %u\n\r", rx_recv);
+  HAL_UART_Transmit(&huart2, (uint8_t*)i2c_rx_message, strlen(i2c_rx_message), HAL_MAX_DELAY);
+  // Update TX buffer
+  osMutexAcquire(I2CMutexTXHandle, portMAX_DELAY);
+  tx_buf = rx_recv;
+  osMutexRelease(I2CMutexTXHandle);
+}
 
 /* USER CODE END 0 */
 
@@ -111,12 +180,22 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();
+  /* Create the mutex(es) */
+  /* creation of I2CMutexTX */
+  I2CMutexTXHandle = osMutexNew(&I2CMutexTX_attributes);
+
+  /* creation of UARTMutex */
+  UARTMutexHandle = osMutexNew(&UARTMutex_attributes);
+
+  /* creation of I2CMutexRX */
+  I2CMutexRXHandle = osMutexNew(&I2CMutexRX_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -135,11 +214,14 @@ int main(void)
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of mainTask */
-  mainTaskHandle = osThreadNew(StartMain, NULL, &mainTask_attributes);
+  /* creation of logTask */
+  logTaskHandle = osThreadNew(StartLog, NULL, &logTask_attributes);
 
-  /* creation of otherTask */
-  otherTaskHandle = osThreadNew(StartOther, NULL, &otherTask_attributes);
+  /* creation of I2CSendTask */
+  I2CSendTaskHandle = osThreadNew(StartI2CSend, NULL, &I2CSendTask_attributes);
+
+  /* creation of I2CReceiveTask */
+  I2CReceiveTaskHandle = osThreadNew(StartI2CReceive, NULL, &I2CReceiveTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -203,8 +285,9 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1|RCC_PERIPHCLK_TIM1;
   PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
+  PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -256,6 +339,56 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 64;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
 
 }
 
@@ -335,49 +468,81 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE END 4 */
 
-/* USER CODE BEGIN Header_StartMain */
+/* USER CODE BEGIN Header_StartLog */
 /**
-  * @brief  Function implementing the mainTask thread.
+  * @brief  Function implementing the logTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartMain */
-void StartMain(void *argument)
+/* USER CODE END Header_StartLog */
+void StartLog(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
   for(;;)
   {
-    // Toggle on-board LED
+    // Toggle LED
     HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-    osDelay(300);
+    // UART Send
+    char heart_beat_message[MAX_STRING_LEN];
+    sprintf(heart_beat_message, "STM32 Online (%u)\n\r", heart_beat_count);
+    HAL_UART_Transmit(&huart2, (uint8_t*)heart_beat_message, strlen(heart_beat_message), HAL_MAX_DELAY);
+    // Update heart beat
+    heart_beat_count++;
+    heart_beat_count = heart_beat_count % HEARTBEAT_MAX;
+    osDelay(HEARTBEAT_SLEEP);
   }
   osThreadTerminate(NULL);
   /* USER CODE END 5 */
 }
 
-/* USER CODE BEGIN Header_StartOther */
+/* USER CODE BEGIN Header_StartI2CSend */
 /**
-* @brief Function implementing the otherTask thread.
+* @brief Function implementing the I2CSendTask thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartOther */
-void StartOther(void *argument)
+/* USER CODE END Header_StartI2CSend */
+void StartI2CSend(void *argument)
 {
-  /* USER CODE BEGIN StartOther */
+  /* USER CODE BEGIN StartI2CSend */
+  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
   /* Infinite loop */
   for(;;)
   {
-    // Toggle on-board LED
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-    // Send heart beat to Serial Port
-    char *hbeat = "STM32 heart beat\n\r";
-    HAL_UART_Transmit(&huart2, (uint8_t*)hbeat, strlen(hbeat), HAL_MAX_DELAY);
-    osDelay(1000);
+    // I2C Send
+    osMutexAcquire(I2CMutexTXHandle, portMAX_DELAY);
+    HAL_I2C_Slave_Transmit(&hi2c1, (uint8_t*)&tx_buf, TXBUFSIZE, 0x01);
+    osMutexRelease(I2CMutexTXHandle);
+    osDelay(I2C_SLEEP);
   }
   osThreadTerminate(NULL);
-  /* USER CODE END StartOther */
+  /* USER CODE END StartI2CSend */
+}
+
+/* USER CODE BEGIN Header_StartI2CReceive */
+/**
+* @brief Function implementing the I2CReceiveTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartI2CReceive */
+void StartI2CReceive(void *argument)
+{
+  /* USER CODE BEGIN StartI2CReceive */
+  HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE); // async
+  /* Infinite loop */
+  for(;;)
+  {
+    sig = HAL_I2C_Slave_Receive(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE, 0xFFFFFFFF); // blocking
+    if (sig == HAL_OK) {
+      // Process Data
+      ProcessI2CData();
+    }
+    osDelay(I2C_SLEEP);
+  }
+  osThreadTerminate(NULL);
+  /* USER CODE END StartI2CReceive */
 }
 
 /**
