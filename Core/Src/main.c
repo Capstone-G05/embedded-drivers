@@ -37,9 +37,9 @@
 #define TXBUFSIZE       1
 #define RXBUFSIZE       1
 #define HEARTBEAT_MAX   9999
-#define HEARTBEAT_SLEEP 500
+#define HEARTBEAT_SLEEP 5000
 #define MAX_STRING_LEN  50
-#define I2C_SLEEP       25
+#define I2C_SLEEP       10
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -111,7 +111,7 @@ void StartI2CReceive(void *argument);
 
 /* USER CODE BEGIN PFP */
 void ResetI2C(I2C_HandleTypeDef* rev_i2c);
-void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c);
+//void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c);
 void ProcessI2CData();
 /* USER CODE END PFP */
 
@@ -123,27 +123,31 @@ void ResetI2C(I2C_HandleTypeDef* rev_i2c)
   HAL_I2C_Init(rev_i2c);
 }
 
-void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
-  if (hi2c->Instance == I2C1) {
-    // Process Data
-    ProcessI2CData();
-    // Restart I2C reception
-    HAL_I2C_Slave_Receive_IT(hi2c, (uint8_t*)rx_buf, RXBUFSIZE);
-  }
-}
+//void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+//  if (hi2c->Instance == I2C1) {
+//    // Process Data
+//    ProcessI2CData();
+//    // Restart I2C reception
+//    HAL_I2C_Slave_Receive_IT(hi2c, (uint8_t*)rx_buf, RXBUFSIZE);
+//  }
+//}
 
 void ProcessI2CData()
 {
+  // Read RX Buffer
   osMutexAcquire(I2CMutexRXHandle, portMAX_DELAY);
   uint8_t rx_recv = rx_buf[0];
   osMutexRelease(I2CMutexRXHandle);
-  //UART Send
+  // UART Log Message
   char i2c_rx_message[MAX_STRING_LEN];
-  sprintf(i2c_rx_message, "RECEIVED: %u\n\r", rx_recv);
+  sprintf(i2c_rx_message, "RECEIVED: 0x%02X\n\r", rx_recv);
   HAL_UART_Transmit(&huart2, (uint8_t*)i2c_rx_message, strlen(i2c_rx_message), HAL_MAX_DELAY);
-  // Update TX buffer
+  // Update TX Buffer
   osMutexAcquire(I2CMutexTXHandle, portMAX_DELAY);
   tx_buf = rx_recv;
+
+  HAL_I2C_Slave_Transmit(&hi2c1, (uint8_t*)&tx_buf, TXBUFSIZE, HAL_MAX_DELAY); // blocking
+
   osMutexRelease(I2CMutexTXHandle);
 }
 
@@ -510,11 +514,11 @@ void StartI2CSend(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    // I2C Send
-    osMutexAcquire(I2CMutexTXHandle, portMAX_DELAY);
-    HAL_I2C_Slave_Transmit(&hi2c1, (uint8_t*)&tx_buf, TXBUFSIZE, 0x01);
-    osMutexRelease(I2CMutexTXHandle);
-    osDelay(I2C_SLEEP);
+//    // I2C Send
+//    osMutexAcquire(I2CMutexTXHandle, portMAX_DELAY);
+//    HAL_I2C_Slave_Transmit(&hi2c1, (uint8_t*)&tx_buf, TXBUFSIZE, 0x01);
+//    osMutexRelease(I2CMutexTXHandle);
+//    osDelay(I2C_SLEEP);
   }
   osThreadTerminate(NULL);
   /* USER CODE END StartI2CSend */
@@ -530,14 +534,18 @@ void StartI2CSend(void *argument)
 void StartI2CReceive(void *argument)
 {
   /* USER CODE BEGIN StartI2CReceive */
-  HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE); // async
+//  HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE); // async
   /* Infinite loop */
   for(;;)
   {
-    sig = HAL_I2C_Slave_Receive(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE, 0xFFFFFFFF); // blocking
+//    char *i2c_wait_message = "Waiting for I2C...\n\r";
+//    HAL_UART_Transmit(&huart2, (uint8_t*)i2c_wait_message, strlen(i2c_wait_message), HAL_MAX_DELAY);
+
+    sig = HAL_I2C_Slave_Receive(&hi2c1, (uint8_t*)&rx_buf, RXBUFSIZE, HAL_MAX_DELAY); // blocking
     if (sig == HAL_OK) {
       // Process Data
       ProcessI2CData();
+      osDelay(I2C_SLEEP);
     }
     osDelay(I2C_SLEEP);
   }
