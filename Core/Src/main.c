@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <string.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -82,15 +84,28 @@ typedef enum {
 } MISCIndex;
 
 typedef struct {
-  uint8_t read_write : 1;  // Read/Write Bit
-  uint8_t type : 7;        // Peripheral Type
-  uint8_t index;           // Peripheral Index
-  uint16_t value;          // Message Value
+  uint8_t read_write : 1;
+  uint8_t type : 7;
+  uint8_t index : 8;
+  uint16_t value : 16;
 } RPiMessage;
+
+typedef struct {
+  uint8_t priority : 3;
+  uint8_t reserved : 1;
+  uint8_t data_page : 1;
+  uint8_t pdu_format : 8;
+  uint8_t pdu_specific : 8;
+  uint8_t source_address : 8;
+  uint32_t pgn : 18;
+  uint8_t data[8];
+} J1939Message;
 
 typedef enum {
   NORMAL = 1,
   I2C_ERROR = 2,
+  CAN_ERROR = 3,
+  OS_ERROR = 4,
 } Status;
 
 /* USER CODE END PTD */
@@ -98,17 +113,26 @@ typedef enum {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define RPI_TX_BUFFER_SIZE 4  // bytes
-#define RPI_RX_BUFFER_SIZE 4  // bytes
+#define I2C_TX_BUFFER_SIZE 4  // bytes
+#define I2C_RX_BUFFER_SIZE 4  // bytes
+#define CAN_TX_BUFFER_SIZE 8  // bytes
+#define CAN_RX_BUFFER_SIZE 8  // bytes
 
 #define STATUS_PERIOD 1000    // milliseconds
 #define DATA_INTERVAL 300     // milliseconds
 #define BLINK_SPEED   100     // milliseconds
 
-#define MAX_PERIPHERAL_TYPE 8
-#define MAX_PERIPHERAL_INDEX 32
+#define MAX_PERIPHERAL_TYPE  4
+#define MAX_PERIPHERAL_INDEX 14
 
 #define DEFAULT_DATA_VALUE 0xFFFF
+
+#define FALCON_ADDRESS       0x31
+#define MERLIN_EXCITATION    0x02
+#define MERLIN_RESOLUTION    0x02
+#define MERLIN_SAMPLING_RATE 0x06
+#define MERLIN_FILETER_WIDTH 0x01
+#define MERLIN_GAIN       0x??
 
 /* USER CODE END PD */
 
@@ -123,42 +147,44 @@ ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
+CAN_HandleTypeDef hcan;
+
 I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart1;
 
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
+/* Definitions for loggingTask */
+osThreadId_t loggingTaskHandle;
+const osThreadAttr_t loggingTask_attributes = {
+  .name = "loggingTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for pollingTask */
+osThreadId_t pollingTaskHandle;
+const osThreadAttr_t pollingTask_attributes = {
+  .name = "pollingTask",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for rpiTask */
-osThreadId_t rpiTaskHandle;
-const osThreadAttr_t rpiTask_attributes = {
-  .name = "rpiTask",
+/* Definitions for realTimeTask */
+osThreadId_t realTimeTaskHandle;
+const osThreadAttr_t realTimeTask_attributes = {
+  .name = "realTimeTask",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for dataTask */
-osThreadId_t dataTaskHandle;
-const osThreadAttr_t dataTask_attributes = {
-  .name = "dataTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for I2CMutex */
-osMutexId_t I2CMutexHandle;
-const osMutexAttr_t I2CMutex_attributes = {
-  .name = "I2CMutex"
+  .priority = (osPriority_t) osPriorityRealtime,
 };
 /* USER CODE BEGIN PV */
 
+osMessageQueueId_t canQueueHandle;
+const osMessageQueueAttr_t canQueue_attributes = {
+  .name = "canQueue"
+};
+
 uint16_t data_table[MAX_PERIPHERAL_TYPE][MAX_PERIPHERAL_INDEX];
 
-volatile uint8_t rpi_tx_buffer[RPI_TX_BUFFER_SIZE];
-volatile uint8_t rpi_rx_buffer[RPI_RX_BUFFER_SIZE];
+uint8_t i2c_tx_buffer[I2C_TX_BUFFER_SIZE];
+uint8_t i2c_rx_buffer[I2C_RX_BUFFER_SIZE];
 
 RPiMessage rpi_message;
 
@@ -170,6 +196,18 @@ const int adc2_channel_count = sizeof (adc2_result_dma) / sizeof (adc2_result_dm
 
 volatile int adc1_complete = 0;
 volatile int adc2_complete = 0;
+
+volatile uint8_t can_transport_active = 0;
+
+//CAN_RxHeaderTypeDef can_rx_header;
+CAN_TxHeaderTypeDef can_tx_header;
+
+//uint8_t can_rx_buffer[CAN_RX_BUFFER_SIZE];
+uint8_t can_tx_buffer[CAN_TX_BUFFER_SIZE];
+
+uint32_t can_tx_mailbox;
+
+//J1939Message can_message;
 
 uint8_t status = NORMAL;
 
@@ -183,9 +221,10 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
-void StartDefaultTask(void *argument);
-void StartRpiTask(void *argument);
-void StartDataTask(void *argument);
+static void MX_CAN_Init(void);
+void StartLoggingTask(void *argument);
+void StartPollingTask(void *argument);
+void StartRealTimeTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -194,26 +233,29 @@ void ResetI2C(I2C_HandleTypeDef *rev_i2c);
 void InitializeData();
 
 void BlinkStatus(uint8_t count, uint16_t delay);
-void ParsePRiMessage(RPiMessage *msg);
-void ProcessRPiMessage();\
+
+void ParseRPiMessage(uint8_t *i2c_data, RPiMessage *msg);
+void ParseJ1939Message(uint32_t can_id, uint8_t *can_data, J1939Message *msg);
+
+void ProcessRPiMessage();
+void ProcessJ1939Message(J1939Message j1939_message);
+
+void StartMerlinData(uint8_t address);
+void SendMerlinData(uint8_t address);
+void SendMerlinConfig(uint8_t address);
+void ClaimJ1939Address(uint8_t address);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
-  * @brief  Re-initialize the I2C communication bus.
-  */
 void ResetI2C(I2C_HandleTypeDef *rev_i2c)
 {
   HAL_I2C_DeInit(rev_i2c);
   HAL_I2C_Init(rev_i2c);
 }
 
-/**
-  * @brief  Populate data lookup tables with default data.
-  */
 void InitializeData() {
   // Initialize all entries with 0xFFFF (invalid value)
   for (size_t type = 0; type < MAX_PERIPHERAL_TYPE; type++) {
@@ -223,9 +265,6 @@ void InitializeData() {
   }
 }
 
-/**
-  * @brief  Flash the status LED every 'delay' milliseconds for 'count' times.
-  */
 void BlinkStatus(uint8_t count, uint16_t delay)
 {
   for (int i = 0; i < (count * 2) ; i++)
@@ -236,15 +275,24 @@ void BlinkStatus(uint8_t count, uint16_t delay)
   }
 }
 
-/**
-  * @brief  Parse 4-bytes into a RPiMessage.
-  */
-void ParseRPiMessage(RPiMessage *msg)
+void ParseRPiMessage(uint8_t *i2c_data, RPiMessage *msg)
 {
-    msg->read_write = (rpi_rx_buffer[0] >> 7) & 0x01;         // bit 7
-    msg->type = rpi_rx_buffer[0] & 0x7F;                      // bits 0-6
-    msg->index = rpi_rx_buffer[1];                            // second byte
-    msg->value = (rpi_rx_buffer[2] << 8) | rpi_rx_buffer[3];  // third & fourth bytes
+  msg->read_write = (i2c_data[0] >> 7) & 0x01;
+  msg->type = i2c_data[0] & 0x7F;
+  msg->index = i2c_data[1];
+  msg->value = (i2c_data[2] << 8) | i2c_data[3];
+}
+
+void ParseJ1939Message(uint32_t can_id, uint8_t *can_data, J1939Message *msg)
+{
+  msg->priority = (can_id >> 26) & 0x07;
+  msg->reserved = (can_id >> 25) & 0x01;
+  msg->data_page = (can_id >> 24) & 0x01;
+  msg->pdu_format = (can_id >> 16) & 0xFF;
+  msg->pdu_specific = (can_id >> 8) & 0xFF;
+  msg->source_address = can_id & 0xFF;
+  msg->pgn = (can_id >> 8) & 0x3FFFF;
+  memcpy(msg->data, can_data, 8);
 }
 
 /**
@@ -252,32 +300,231 @@ void ParseRPiMessage(RPiMessage *msg)
   */
 void ProcessRPiMessage()
 {
-  // Read the 'rpi_rx_buffer' into 'rpi_message'
-  ParseRPiMessage(&rpi_message);
-
+  ParseRPiMessage(i2c_rx_buffer, &rpi_message);
   uint16_t return_value = DEFAULT_DATA_VALUE;
 
-  // Process 'read' commands
   if (rpi_message.read_write == READ)
   {
     return_value = data_table[rpi_message.type][rpi_message.index];
   }
 
-  // Process 'write' commands
   if (rpi_message.read_write == WRITE)
   {
     data_table[rpi_message.type][rpi_message.index] = rpi_message.value;
     return_value = data_table[rpi_message.type][rpi_message.index];
   }
 
-  // Update the 'tx_buffer'
-  rpi_tx_buffer[0] = rpi_rx_buffer[0];            // Echo back peripheral type
-  rpi_tx_buffer[1] = rpi_rx_buffer[1];            // Echo back peripheral index
-  rpi_tx_buffer[2] = (return_value >> 8) & 0xFF;  // High byte of 'return_value'
-  rpi_tx_buffer[3] = return_value & 0xFF;         // Low byte of 'return_value'
+  i2c_tx_buffer[0] = i2c_rx_buffer[0];
+  i2c_tx_buffer[1] = i2c_rx_buffer[1];
+  i2c_tx_buffer[2] = (return_value >> 8) & 0xFF;
+  i2c_tx_buffer[3] = return_value & 0xFF;
+  HAL_I2C_Slave_Transmit_IT(&hi2c1, (uint8_t*)&i2c_tx_buffer, I2C_TX_BUFFER_SIZE);
+}
 
-  // Respond to RPi
-  HAL_I2C_Slave_Transmit_IT(&hi2c1, (uint8_t*)&rpi_tx_buffer, RPI_TX_BUFFER_SIZE);
+void ProcessJ1939Message(J1939Message j1939_message)
+{
+  // Device Addressing
+  if (j1939_message.pgn == 0xFED8)
+  {
+    // TODO: handle device addressing
+  }
+  // Sensor Configuration
+  else if (j1939_message.pdu_format == 0xEF)
+  {
+    // TODO: process and save configuration options
+    SendMerlinConfig(j1939_message.pdu_specific);
+  }
+  // Transport Protocol
+  else if (j1939_message.pdu_format == 0xEC)
+  {
+    if (j1939_message.data[0] == 0x11) // start
+    {
+      SendMerlinData(j1939_message.pdu_specific);
+    }
+    if (j1939_message.data[0] == 0x13) // stop
+    {
+      // ignore
+    }
+  }
+  // Merlin Sensor Reading
+  else if (j1939_message.pdu_format == 0xEA)
+  {
+    StartMerlinData(j1939_message.pdu_specific);
+  }
+}
+
+void StartMerlinData(uint8_t address)
+{
+  can_tx_header.ExtId = 0x1CEC0000 | (FALCON_ADDRESS << 8) | address;
+  can_tx_header.IDE = CAN_ID_EXT;
+  can_tx_header.RTR = CAN_RTR_DATA;
+  can_tx_header.DLC = CAN_RX_BUFFER_SIZE;
+  can_tx_header.TransmitGlobalTime = DISABLE;
+
+  can_tx_buffer[0] = 0x10;
+  can_tx_buffer[1] = 0x16;
+  can_tx_buffer[2] = 0x00;
+  can_tx_buffer[3] = 0x04;
+  can_tx_buffer[4] = 0xFF;
+  can_tx_buffer[5] = 0x80;
+  can_tx_buffer[6] = 0xFF;
+  can_tx_buffer[7] = 0x00;
+
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+}
+
+void SendMerlinData(uint8_t address)
+{
+  uint8_t offset = (address - 0xB5) * 4;
+  int32_t weight_1 = (int32_t)data_table[TYPE_CAN][INDEX_LDC1 + offset];
+  int32_t weight_2 = (int32_t)data_table[TYPE_CAN][INDEX_LDC2 + offset];
+  int32_t weight_3 = (int32_t)data_table[TYPE_CAN][INDEX_LDC3 + offset];
+  int32_t weight_4 = (int32_t)data_table[TYPE_CAN][INDEX_LDC4 + offset];
+
+  // gain * excitation = 15,000,000
+  uint8_t gain = 100;
+  int32_t excitation_voltage = 150000;
+
+  can_tx_header.ExtId = 0x1CEB0000 | (FALCON_ADDRESS << 8) | address;
+  can_tx_header.IDE = CAN_ID_EXT;
+  can_tx_header.RTR = CAN_RTR_DATA;
+  can_tx_header.DLC = CAN_RX_BUFFER_SIZE;
+  can_tx_header.TransmitGlobalTime = DISABLE;
+
+  can_tx_buffer[0] = 0x01;
+  can_tx_buffer[1] = (MERLIN_RESOLUTION << 4) | MERLIN_EXCITATION;
+  can_tx_buffer[2] = gain;
+  can_tx_buffer[3] = excitation_voltage & 0xFF;
+  can_tx_buffer[4] = (excitation_voltage >> 8) & 0xFF;
+  can_tx_buffer[5] = (excitation_voltage >> 16) & 0xFF;
+  can_tx_buffer[6] = (excitation_voltage >> 24) & 0xFF;
+  can_tx_buffer[7] = weight_1 & 0xFF;
+
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+
+  can_tx_buffer[0] = 0x02;
+  can_tx_buffer[1] = (weight_1 >> 8) & 0xFF;
+  can_tx_buffer[2] = (weight_1 >> 16) & 0xFF;
+  can_tx_buffer[3] = (weight_1 >> 24) & 0xFF;
+  can_tx_buffer[4] = weight_2 & 0xFF;
+  can_tx_buffer[5] = (weight_2 >> 8) & 0xFF;
+  can_tx_buffer[6] = (weight_2 >> 16) & 0xFF;
+  can_tx_buffer[7] = (weight_2 >> 24) & 0xFF;
+
+  while (HAL_CAN_IsTxMessagePending(&hcan, can_tx_mailbox) == SET) {}
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+
+  can_tx_buffer[0] = 0x03;
+  can_tx_buffer[1] = weight_3 & 0xFF;
+  can_tx_buffer[2] = (weight_3 >> 8) & 0xFF;
+  can_tx_buffer[3] = (weight_3 >> 16) & 0xFF;
+  can_tx_buffer[4] = (weight_3 >> 24) & 0xFF;
+  can_tx_buffer[5] = weight_4 & 0xFF;
+  can_tx_buffer[6] = (weight_4 >> 8) & 0xFF;
+  can_tx_buffer[7] = (weight_4 >> 16) & 0xFF;
+
+  while (HAL_CAN_IsTxMessagePending(&hcan, can_tx_mailbox) == SET) {}
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+
+  can_tx_buffer[0] = 0x04;
+  can_tx_buffer[1] = (weight_4 >> 24) & 0xFF;
+  can_tx_buffer[2] = 0xFF;
+  can_tx_buffer[3] = 0xFF;
+  can_tx_buffer[4] = 0xFF;
+  can_tx_buffer[5] = 0xFF;
+  can_tx_buffer[6] = 0xFF;
+  can_tx_buffer[7] = 0xFF;
+
+  while (HAL_CAN_IsTxMessagePending(&hcan, can_tx_mailbox) == SET) {}
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+}
+
+void SendMerlinConfig(uint8_t address)
+{
+  can_tx_header.ExtId = 0x18EF0000 | (FALCON_ADDRESS << 8) | address;
+  can_tx_header.IDE = CAN_ID_EXT;
+  can_tx_header.RTR = CAN_RTR_DATA;
+  can_tx_header.DLC = CAN_RX_BUFFER_SIZE;
+  can_tx_header.TransmitGlobalTime = DISABLE;
+
+  can_tx_buffer[0] = 0x01; // must be set to 1
+  can_tx_buffer[1] = 0x0F; // response (9-12)
+  can_tx_buffer[2] = 0xFF; // unused
+  can_tx_buffer[3] = 0xFF; // unused
+  can_tx_buffer[4] = 0xFF; // unused
+  can_tx_buffer[5] = 0xFF; // unused
+  can_tx_buffer[6] = 0xFF; // unused
+  can_tx_buffer[7] = 0xFF; // unused
+
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+}
+
+void ClaimJ1939Address(uint8_t address)
+{
+  can_tx_header.ExtId = 0x18EEFF00 | (FALCON_ADDRESS << 8) | address;
+  can_tx_header.IDE = CAN_ID_EXT;
+  can_tx_header.RTR = CAN_RTR_DATA;
+  can_tx_header.DLC = CAN_RX_BUFFER_SIZE;
+  can_tx_header.TransmitGlobalTime = DISABLE;
+
+  can_tx_buffer[0] = 0xFE;
+  can_tx_buffer[1] = 0x2A;
+  can_tx_buffer[2] = 0x60;
+  can_tx_buffer[3] = 0x49;
+  can_tx_buffer[4] = 0x00;
+  can_tx_buffer[5] = 0x87;
+  can_tx_buffer[6] = 0x22;
+  can_tx_buffer[7] = 0xA0;
+
+  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+
+  // beyond this... I'm not too sure what's going on
+
+//  can_tx_header.ExtId = 0x18E80000 | (FALCON_ADDRESS << 8) | address;
+//
+//  can_tx_buffer[0] = 0x01;
+//  can_tx_buffer[1] = 0x00;
+//  can_tx_buffer[2] = 0xFF;
+//  can_tx_buffer[3] = 0xFF;
+//  can_tx_buffer[4] = 0xFF;
+//  can_tx_buffer[5] = 0x80;
+//  can_tx_buffer[6] = 0xFF;
+//  can_tx_buffer[7] = 0x00;
+//
+//  osDelay(250);
+//  while (HAL_CAN_IsTxMessagePending(&hcan, can_tx_mailbox) == SET) {}
+//  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+//  {
+//    status = CAN_ERROR;
+//  }
+//
+//  osDelay(250);
+//  while (HAL_CAN_IsTxMessagePending(&hcan, can_tx_mailbox) == SET) {}
+//  if (HAL_CAN_AddTxMessage(&hcan, &can_tx_header, can_tx_buffer, &can_tx_mailbox) != HAL_OK)
+//  {
+//    status = CAN_ERROR;
+//  }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
@@ -304,7 +551,7 @@ void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
   if (hi2c == &hi2c1)
   {
-    HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&rpi_rx_buffer, RPI_RX_BUFFER_SIZE);
+    HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&i2c_rx_buffer, I2C_RX_BUFFER_SIZE);
   }
 }
 
@@ -318,6 +565,24 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
   }
 }
 
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  CAN_RxHeaderTypeDef can_rx_header;
+  uint8_t can_rx_buffer[CAN_RX_BUFFER_SIZE];
+  J1939Message can_message;
+
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &can_rx_header, can_rx_buffer) != HAL_OK)
+  {
+    status = CAN_ERROR;
+  }
+
+  ParseJ1939Message(can_rx_header.ExtId, can_rx_buffer, &can_message);
+
+  if (osMessageQueuePut(canQueueHandle, &can_message, 0, 0) != osOK)
+  {
+    status = OS_ERROR;
+  }
+}
 
 
 /* USER CODE END 0 */
@@ -356,15 +621,13 @@ int main(void)
   MX_USART1_UART_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
+  MX_CAN_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();
-  /* Create the mutex(es) */
-  /* creation of I2CMutex */
-  I2CMutexHandle = osMutexNew(&I2CMutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -379,18 +642,20 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+
+  canQueueHandle = osMessageQueueNew (16, sizeof(J1939Message), &canQueue_attributes);
+
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  /* creation of loggingTask */
+  loggingTaskHandle = osThreadNew(StartLoggingTask, NULL, &loggingTask_attributes);
 
-  /* creation of rpiTask */
-  rpiTaskHandle = osThreadNew(StartRpiTask, NULL, &rpiTask_attributes);
+  /* creation of pollingTask */
+  pollingTaskHandle = osThreadNew(StartPollingTask, NULL, &pollingTask_attributes);
 
-  /* creation of dataTask */
-  dataTaskHandle = osThreadNew(StartDataTask, NULL, &dataTask_attributes);
+  /* creation of realTimeTask */
+  realTimeTaskHandle = osThreadNew(StartRealTimeTask, NULL, &realTimeTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -660,6 +925,93 @@ static void MX_ADC2_Init(void)
 }
 
 /**
+  * @brief CAN Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN_Init(void)
+{
+
+  /* USER CODE BEGIN CAN_Init 0 */
+
+  /* USER CODE END CAN_Init 0 */
+
+  /* USER CODE BEGIN CAN_Init 1 */
+
+  /* USER CODE END CAN_Init 1 */
+  hcan.Instance = CAN;
+  hcan.Init.Prescaler = 2;
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_7TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_8TQ;
+  hcan.Init.TimeTriggeredMode = DISABLE;
+  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoWakeUp = DISABLE;
+  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN_Init 2 */
+
+  CAN_FilterTypeDef can_filter_config1, can_filter_config2, can_filter_config3;
+
+  can_filter_config1.FilterBank = 0;
+  can_filter_config1.FilterMode = CAN_FILTERMODE_IDMASK;
+  can_filter_config1.FilterScale = CAN_FILTERSCALE_32BIT;
+  can_filter_config1.FilterIdHigh = (0x18EAB631 >> 13) & 0xFFFF;
+  can_filter_config1.FilterIdLow = ( 0x18EAB631 << 3) & 0xFFF8;
+  can_filter_config1.FilterMaskIdHigh = (0x1FFFF000 >> 13) & 0xFFFF;
+  can_filter_config1.FilterMaskIdLow =(0x1FFFF000 << 3) & 0xFFF8;
+  can_filter_config1.FilterFIFOAssignment = CAN_RX_FIFO0;
+  can_filter_config1.FilterActivation = ENABLE;
+
+  can_filter_config2.FilterBank = 1;
+  can_filter_config2.FilterMode = CAN_FILTERMODE_IDMASK;
+  can_filter_config2.FilterScale = CAN_FILTERSCALE_32BIT;
+  can_filter_config2.FilterIdHigh = (0x1CECB631 >> 13) & 0xFFFF;
+  can_filter_config2.FilterIdLow = (0x1CECB631 << 3) & 0xFFF8;
+  can_filter_config2.FilterMaskIdHigh = (0x1FFFF000 >> 13) & 0xFFFF;
+  can_filter_config2.FilterMaskIdLow = (0x1FFFF000 << 3) & 0xFFF8;
+  can_filter_config2.FilterFIFOAssignment = CAN_RX_FIFO0;
+  can_filter_config2.FilterActivation = ENABLE;
+
+  can_filter_config3.FilterBank = 2;
+  can_filter_config3.FilterMode = CAN_FILTERMODE_IDMASK;
+  can_filter_config3.FilterScale = CAN_FILTERSCALE_32BIT;
+  can_filter_config3.FilterIdHigh = (0x18EFB631 >> 13) & 0xFFFF;
+  can_filter_config3.FilterIdLow = (0x18EFB631 << 3) & 0xFFF8;
+  can_filter_config3.FilterMaskIdHigh = (0x1FFFF000 >> 13) & 0xFFFF;
+  can_filter_config3.FilterMaskIdLow = (0x1FFFF000 << 3) & 0xFFF8;
+  can_filter_config3.FilterFIFOAssignment = CAN_RX_FIFO0;
+  can_filter_config3.FilterActivation = ENABLE;
+
+  if (HAL_CAN_ConfigFilter(&hcan, &can_filter_config1) != HAL_OK)
+  {
+    status = CAN_ERROR;
+    Error_Handler();
+  }
+
+  if (HAL_CAN_ConfigFilter(&hcan, &can_filter_config2) != HAL_OK)
+  {
+    status = CAN_ERROR;
+    Error_Handler();
+  }
+
+  if (HAL_CAN_ConfigFilter(&hcan, &can_filter_config3) != HAL_OK)
+  {
+    status = CAN_ERROR;
+    Error_Handler();
+  }
+
+  /* USER CODE END CAN_Init 2 */
+
+}
+
+/**
   * @brief I2C1 Initialization Function
   * @param None
   * @retval None
@@ -796,21 +1148,20 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE END 4 */
 
-/* USER CODE BEGIN Header_StartDefaultTask */
+/* USER CODE BEGIN Header_StartLoggingTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
+  * @brief  Function implementing the loggingTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+/* USER CODE END Header_StartLoggingTask */
+void StartLoggingTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
   for(;;)
   {
     data_table[TYPE_MISC][INDEX_STATUS] = status;
-    // Flash 'status' LED
     BlinkStatus(status, BLINK_SPEED);
     osDelay(STATUS_PERIOD);
   }
@@ -818,37 +1169,19 @@ void StartDefaultTask(void *argument)
   /* USER CODE END 5 */
 }
 
-/* USER CODE BEGIN Header_StartRpiTask */
+/* USER CODE BEGIN Header_StartPollingTask */
 /**
-* @brief Function implementing the rpiTask thread.
+* @brief Function implementing the pollingTask thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartRpiTask */
-void StartRpiTask(void *argument)
+/* USER CODE END Header_StartPollingTask */
+void StartPollingTask(void *argument)
 {
-  /* USER CODE BEGIN StartRpiTask */
-  HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&rpi_rx_buffer, RPI_RX_BUFFER_SIZE);
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  osThreadTerminate(NULL);
-  /* USER CODE END StartRpiTask */
-}
+  /* USER CODE BEGIN StartPollingTask */
 
-/* USER CODE BEGIN Header_StartDataTask */
-/**
-* @brief Function implementing the dataTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartDataTask */
-void StartDataTask(void *argument)
-{
-  /* USER CODE BEGIN StartDataTask */
   InitializeData();
+
   /* Infinite loop */
   for(;;)
   {
@@ -857,15 +1190,18 @@ void StartDataTask(void *argument)
     {
       Error_Handler();
     }
+
     // Read ADC2
     if (HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_result_dma, adc2_channel_count) != HAL_OK)
     {
       Error_Handler();
     }
+
     // Wait for DMA to finish
     while (!adc1_complete && !adc2_complete) {}
     adc1_complete = 0;
     adc2_complete = 0;
+
     // Update Values
     data_table[TYPE_PWM][INDEX_PA0] = adc1_result_dma[0];
     data_table[TYPE_PWM][INDEX_PA1] = adc1_result_dma[1];
@@ -879,15 +1215,47 @@ void StartDataTask(void *argument)
     data_table[TYPE_PWM][INDEX_PA7] = adc2_result_dma[3];
     data_table[TYPE_PWM][INDEX_PB2] = adc2_result_dma[4];
 
-    // todo: CAN
-
     // Toggle LED 0
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, data_table[TYPE_GPIO][INDEX_PB5]);
 
     osDelay(DATA_INTERVAL);
   }
   osThreadTerminate(NULL);
-  /* USER CODE END StartDataTask */
+  /* USER CODE END StartPollingTask */
+}
+
+/* USER CODE BEGIN Header_StartRealTimeTask */
+/**
+* @brief Function implementing the realTimeTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartRealTimeTask */
+void StartRealTimeTask(void *argument)
+{
+  /* USER CODE BEGIN StartRealTimeTask */
+
+  J1939Message message;
+
+  HAL_I2C_Slave_Receive_IT(&hi2c1, (uint8_t*)&i2c_rx_buffer, I2C_RX_BUFFER_SIZE);
+
+  HAL_CAN_Start(&hcan);
+  HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+  ClaimJ1939Address(0xB5);
+  ClaimJ1939Address(0xB6);
+
+  /* Infinite loop */
+  for(;;)
+  {
+    if (osMessageQueueGet(canQueueHandle, &message, NULL, 0) == osOK)
+    {
+      ProcessJ1939Message(message);
+    }
+    osDelay(1);
+  }
+  osThreadTerminate(NULL);
+  /* USER CODE END StartRealTimeTask */
 }
 
 /**
